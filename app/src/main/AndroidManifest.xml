@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 用於監聽通知的核心權限 -->
+    <uses-permission android:name="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+        tools:ignore="ProtectedPermissions" />
+    <!-- 保持服務在螢幕關閉時運作 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    
+    <!-- 取代 QUERY_ALL_PACKAGES 以符合 Play Store 規範 -->
+    <queries>
+        <!-- 查詢所有一般 App (有桌面圖示的) -->
+        <intent>
+            <action android:name="android.content.Intent.ACTION_MAIN" />
+            <category android:name="android.content.Intent.CATEGORY_LAUNCHER" />
+        </intent>
+        <!-- 查詢媒體服務 (音樂播放器常有此服務) -->
+        <intent>
+            <action android:name="android.media.browse.MediaBrowserService" />
+        </intent>
+        
+        <!-- 明確宣告要互動的目標 App，確保 MediaSession 可見性 -->
+        <package android:name="com.google.android.youtube" />
+        <package android:name="com.google.android.apps.youtube.music" />
+        <package android:name="app.revanced.android.youtube" />
+        <package android:name="com.spotify.music" />
+    </queries>
+    
+    <!-- 顯示通知 (Android 13+) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 喚醒鎖定 (確保 TTS 完整播放) -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.YTWhatsSong"
+        tools:targetApi="31">
+
+        <!-- 主活動 -->
+        <activity
+            android:name="com.korit.ytwhatssong.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 媒體監聽服務 -->
+        <service
+            android:name="com.korit.ytwhatssong.MediaMonitorService"
+            android:label="@string/service_name"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
+            android:exported="true"
+            android:foregroundServiceType="mediaPlayback">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+
+    </application>
+
+</manifest>

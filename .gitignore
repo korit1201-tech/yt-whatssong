@@ -1,0 +1,21 @@
+# Android Studio generated files
+.gradle/
+build/
+local.properties
+.idea/
+.DS_Store
+
+# Files ignored by IntelliJ
+*.iml
+*.iap_xml
+*.ipr
+*.iws
+
+# Gradle files
+/gradle/
+/gradlew
+/gradlew.bat
+
+# Keystore files
+*.jks
+*.keystore

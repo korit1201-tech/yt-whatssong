@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">什麼歌</string>
+    <string name="service_name">Media Monitor Service</string>
+</resources>
