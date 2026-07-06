@@ -29,23 +29,37 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var serviceToggle: Switch
     private lateinit var screenOnToggle: Switch
+    private lateinit var resumeAnnounceToggle: Switch
     private lateinit var smartParsingToggle: Switch
     private lateinit var useItunesApiToggle: Switch
+    private lateinit var useAiApiToggle: Switch
+    private lateinit var aiApiKeyButton: Button
     private lateinit var selectAppsButton: Button
+    private lateinit var ignoreKeywordsButton: Button
     private lateinit var batteryOptimizationButton: Button
     private lateinit var appInfoButton: Button
     private lateinit var voiceSelectionButton: Button
     private lateinit var googleVoiceToggle: Switch
+    private lateinit var djModeToggle: Switch
+    private lateinit var audioDuckingToggle: Switch
+    private lateinit var speedSeekBar: SeekBar
+    private lateinit var volumeSeekBar: SeekBar
     private var ttsForSelection: android.speech.tts.TextToSpeech? = null
+    private var ttsForSelectionReady = false
 
     companion object {
         private const val TAG = "KOG_MainActivity"
         const val PREFS_NAME = "WhatssongPrefs"
         const val KEY_SERVICE_ENABLED = "serviceEnabled" // Use this to track user's intent
         const val KEY_ANNOUNCE_SCREEN_ON = "announceWhenScreenOn"
+        const val KEY_ANNOUNCE_ON_RESUME = "announceOnResume"
         const val KEY_SMART_TITLE_PARSING = "smartTitleParsing"
         const val KEY_USE_ITUNES_API = "useItunesApi"
+        const val KEY_USE_AI_API = "useAiApi"
+        const val KEY_AI_API_KEY = "aiApiKey"
         const val KEY_MONITORED_APPS = "monitoredApps"
+        const val KEY_IGNORE_KEYWORDS = "ignoreKeywords"
+        const val DEFAULT_IGNORE_KEYWORDS = "直播,精華,全集,合集"
         const val KEY_DJ_MODE = "djMode"
         const val KEY_GOOGLE_VOICE = "googleVoice"
         const val KEY_AUDIO_DUCKING = "audioDucking"
@@ -57,7 +71,7 @@ class MainActivity : AppCompatActivity() {
     // [New] Real-time UI Sync Listener
     private val prefsListener = android.content.SharedPreferences.OnSharedPreferenceChangeListener { prefs, key ->
         if (key == KEY_SERVICE_ENABLED) {
-            val isEnabled = prefs.getBoolean(KEY_SERVICE_ENABLED, false)
+            val isEnabled = prefs.getBoolean(KEY_SERVICE_ENABLED, true)
             runOnUiThread {
                 if (serviceToggle.isChecked != isEnabled) {
                      serviceToggle.isChecked = isEnabled
@@ -143,7 +157,7 @@ class MainActivity : AppCompatActivity() {
         smartParsingToggle = Switch(this).apply {
             text = "本地標題簡化"
             textSize = 16f
-            isChecked = sharedPrefs.getBoolean(KEY_SMART_TITLE_PARSING, true)
+            isChecked = sharedPrefs.getBoolean(KEY_SMART_TITLE_PARSING, false)
             setPadding(0, 24, 0, 24)
         }
         parsingSection.addView(smartParsingToggle)
@@ -153,12 +167,28 @@ class MainActivity : AppCompatActivity() {
         useItunesApiToggle = Switch(this).apply {
             text = "iTunes API 優化"
             textSize = 16f
-            isChecked = sharedPrefs.getBoolean(KEY_USE_ITUNES_API, false)
+            isChecked = sharedPrefs.getBoolean(KEY_USE_ITUNES_API, true)
              setPadding(0, 24, 0, 24)
         }
         parsingSection.addView(useItunesApiToggle)
-        
+
         addDescription(parsingSection, "連線至 Apple 資料庫查詢最正確的歌曲資訊。")
+
+        useAiApiToggle = Switch(this).apply {
+            text = "Gemini AI (Gemma) 優化"
+            textSize = 16f
+            isChecked = sharedPrefs.getBoolean(KEY_USE_AI_API, false)
+             setPadding(0, 24, 0, 24)
+        }
+        parsingSection.addView(useAiApiToggle)
+
+        addDescription(parsingSection, "先查 iTunes（速度快），查無結果才改問 AI 理解整段標題、忽略劇名/集數/MV品牌等雜訊，兩者都失敗才退回本地解析。三選一：本地標題簡化／iTunes／AI 只會有一個生效。")
+
+        aiApiKeyButton = Button(this).apply {
+            text = "設定 Google AI API Key"
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { setMargins(0, 0, 0, 8) }
+        }
+        parsingSection.addView(aiApiKeyButton)
         mainLayout.addView(parsingSection)
 
         // --- Section 3: Monitoring & Actions ---
@@ -168,16 +198,32 @@ class MainActivity : AppCompatActivity() {
         screenOnToggle = Switch(this).apply {
             text = "螢幕開啟時也播報"
             textSize = 16f
-            isChecked = sharedPrefs.getBoolean(KEY_ANNOUNCE_SCREEN_ON, false)
+            isChecked = sharedPrefs.getBoolean(KEY_ANNOUNCE_SCREEN_ON, true)
              setPadding(0, 24, 0, 24)
         }
         actionSection.addView(screenOnToggle)
+
+        resumeAnnounceToggle = Switch(this).apply {
+            text = "暫停恢復播放時也播報"
+            textSize = 16f
+            isChecked = sharedPrefs.getBoolean(KEY_ANNOUNCE_ON_RESUME, true)
+            setPadding(0, 24, 0, 24)
+        }
+        actionSection.addView(resumeAnnounceToggle)
+        addDescription(actionSection, "同一首歌從暫停或停止恢復播放時，重新播報一次歌名與歌手。")
 
         selectAppsButton = Button(this).apply {
             text = "選擇監控應用程式"
             layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { setMargins(0, 32, 0, 0) }
         }
         actionSection.addView(selectAppsButton)
+
+        ignoreKeywordsButton = Button(this).apply {
+            text = "編輯忽略清單"
+            layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply { setMargins(0, 24, 0, 0) }
+        }
+        actionSection.addView(ignoreKeywordsButton)
+        addDescription(actionSection, "命中清單中關鍵字的標題（例如直播、精華、合集）將不會播報，多組關鍵字請用逗號分隔。")
         mainLayout.addView(actionSection)
 
         // --- Section 4: System ---
@@ -201,10 +247,10 @@ class MainActivity : AppCompatActivity() {
         val djSection = createSectionLayout()
         addSectionTitle(djSection, "DJ 與語音設定")
 
-        val djModeToggle = Switch(this).apply {
+        djModeToggle = Switch(this).apply {
             text = "DJ 報幕模式"
             textSize = 16f
-            isChecked = sharedPrefs.getBoolean(KEY_DJ_MODE, false)
+            isChecked = sharedPrefs.getBoolean(KEY_DJ_MODE, true)
             setPadding(0, 24, 0, 24)
             setOnCheckedChangeListener { _, isChecked ->
                 sharedPrefs.edit().putBoolean(KEY_DJ_MODE, isChecked).apply()
@@ -240,7 +286,7 @@ class MainActivity : AppCompatActivity() {
         }
         djSection.addView(voiceSelectionButton)
 
-        val audioDuckingToggle = Switch(this).apply {
+        audioDuckingToggle = Switch(this).apply {
             text = "背景音樂不中斷"
             textSize = 16f
             isChecked = sharedPrefs.getBoolean(KEY_AUDIO_DUCKING, true)
@@ -265,7 +311,7 @@ class MainActivity : AppCompatActivity() {
         }
         speedLayout.addView(speedLabel)
 
-        val speedSeekBar = SeekBar(this).apply {
+        speedSeekBar = SeekBar(this).apply {
             max = 150 // 0.5 to 2.0 -> Range 1.5. Steps 0.1? Let's do 0.01 precision internally but 0.1 UI? 
             // 0 -> 0.5, 70 -> 1.2, 150 -> 2.0
             progress = ((currentSpeed - 0.5f) * 100).toInt()
@@ -295,7 +341,7 @@ class MainActivity : AppCompatActivity() {
         }
         volumeLayout.addView(volumeLabel)
 
-        val volumeSeekBar = SeekBar(this).apply {
+        volumeSeekBar = SeekBar(this).apply {
             max = 100
             progress = (currentVolume * 100).toInt()
             setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
@@ -338,14 +384,16 @@ class MainActivity : AppCompatActivity() {
         // Init TTS for selection
         ttsForSelection = android.speech.tts.TextToSpeech(this) { status ->
              if (status == android.speech.tts.TextToSpeech.SUCCESS) {
+                 ttsForSelectionReady = true
                  runOnUiThread {
                      voiceSelectionButton.text = "選擇語音"
-                     voiceSelectionButton.isEnabled = true
+                     val isServiceEnabled = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean(KEY_SERVICE_ENABLED, true)
+                     updateUiState(isServiceRunning = isServiceEnabled)
                  }
              } else {
                  Log.e(TAG, "TTS Init failed for selection")
                  runOnUiThread {
-                     voiceSelectionButton.text = "語音引擊初始化失敗"
+                     voiceSelectionButton.text = "語音引擎初始化失敗"
                  }
              }
         }
@@ -425,24 +473,51 @@ class MainActivity : AppCompatActivity() {
         screenOnToggle.setOnCheckedChangeListener { _, isChecked ->
             getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putBoolean(KEY_ANNOUNCE_SCREEN_ON, isChecked).apply()
         }
-        
+
+        resumeAnnounceToggle.setOnCheckedChangeListener { _, isChecked ->
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putBoolean(KEY_ANNOUNCE_ON_RESUME, isChecked).apply()
+        }
+
+        // 本地標題簡化 / iTunes API / Gemini AI 三選一，互斥
         smartParsingToggle.setOnCheckedChangeListener { _, isChecked ->
             getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putBoolean(KEY_SMART_TITLE_PARSING, isChecked).apply()
-            if (isChecked && useItunesApiToggle.isChecked) {
-                useItunesApiToggle.isChecked = false // Mutually exclusive
+            if (isChecked) {
+                if (useItunesApiToggle.isChecked) useItunesApiToggle.isChecked = false
+                if (useAiApiToggle.isChecked) useAiApiToggle.isChecked = false
             }
         }
 
         useItunesApiToggle.setOnCheckedChangeListener { _, isChecked ->
             getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putBoolean(KEY_USE_ITUNES_API, isChecked).apply()
-            if (isChecked && smartParsingToggle.isChecked) {
-                smartParsingToggle.isChecked = false // Mutually exclusive
+            if (isChecked) {
+                if (smartParsingToggle.isChecked) smartParsingToggle.isChecked = false
+                if (useAiApiToggle.isChecked) useAiApiToggle.isChecked = false
             }
+        }
+
+        useAiApiToggle.setOnCheckedChangeListener { _, isChecked ->
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit().putBoolean(KEY_USE_AI_API, isChecked).apply()
+            if (isChecked) {
+                if (smartParsingToggle.isChecked) smartParsingToggle.isChecked = false
+                if (useItunesApiToggle.isChecked) useItunesApiToggle.isChecked = false
+                val hasKey = !getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getString(KEY_AI_API_KEY, "").isNullOrBlank()
+                if (!hasKey) {
+                    Toast.makeText(this, "尚未設定 Google AI API Key，iTunes 查無結果時 AI 備援會直接失敗", Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+
+        aiApiKeyButton.setOnClickListener {
+            showAiApiKeyDialog()
         }
 
         selectAppsButton.setOnClickListener {
             // Start with only launcher apps (cleaner list)
             showAppSelectionDialog(showAll = false)
+        }
+
+        ignoreKeywordsButton.setOnClickListener {
+            showIgnoreKeywordsDialog()
         }
 
         voiceSelectionButton.setOnClickListener {
@@ -492,7 +567,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         Log.i(TAG, "checkPermissionsAndState: All required permissions are GRANTED.")
-        val isServiceEnabledByUser = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean(KEY_SERVICE_ENABLED, false)
+        val isServiceEnabledByUser = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).getBoolean(KEY_SERVICE_ENABLED, true)
         updateUiState(isServiceRunning = isServiceEnabledByUser)
     }
     
@@ -502,22 +577,38 @@ class MainActivity : AppCompatActivity() {
             statusText.text = statusMsg
             serviceToggle.isEnabled = false
             screenOnToggle.isEnabled = false
+            resumeAnnounceToggle.isEnabled = false
             smartParsingToggle.isEnabled = false
             useItunesApiToggle.isEnabled = false
+            useAiApiToggle.isEnabled = false
+            aiApiKeyButton.isEnabled = false
             selectAppsButton.isEnabled = false
+            ignoreKeywordsButton.isEnabled = false
+            djModeToggle.isEnabled = false
+            googleVoiceToggle.isEnabled = false
+            voiceSelectionButton.isEnabled = false
+            audioDuckingToggle.isEnabled = false
+            speedSeekBar.isEnabled = false
+            volumeSeekBar.isEnabled = false
         } else {
             statusText.text = if (isServiceRunning) "服務正在運作中" else "服務已停用"
             serviceToggle.isEnabled = true
             serviceToggle.isChecked = isServiceRunning
             screenOnToggle.isEnabled = isServiceRunning
+            resumeAnnounceToggle.isEnabled = isServiceRunning
             smartParsingToggle.isEnabled = isServiceRunning
             useItunesApiToggle.isEnabled = isServiceRunning
+            useAiApiToggle.isEnabled = isServiceRunning
+            aiApiKeyButton.isEnabled = isServiceRunning
             selectAppsButton.isEnabled = isServiceRunning
-            // Enable/Disable new toggles
-            // We need references to them, but they are local variables in onCreate.
-            // For simplicity in this specific task, we'll let them stay enabled or access them if we made them class members.
-            // Since I implemented them as locals in the previous step, I can't easily toggle them here without refactoring.
-            // Ideally, they should be class members. I will address this if requested, but for now user can toggle prefs anytime.
+            ignoreKeywordsButton.isEnabled = isServiceRunning
+            djModeToggle.isEnabled = isServiceRunning
+            googleVoiceToggle.isEnabled = isServiceRunning
+            // 語音選擇還額外依賴「選擇用 TTS 引擎」是否已初始化完成
+            voiceSelectionButton.isEnabled = isServiceRunning && ttsForSelectionReady
+            audioDuckingToggle.isEnabled = isServiceRunning
+            speedSeekBar.isEnabled = isServiceRunning
+            volumeSeekBar.isEnabled = isServiceRunning
         }
     }
 
@@ -657,6 +748,59 @@ class MainActivity : AppCompatActivity() {
                 
                 Toast.makeText(this, "已選擇: ${voiceNames[which]}", Toast.LENGTH_SHORT).show()
                 dialog.dismiss()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun showAiApiKeyDialog() {
+        val sharedPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val current = sharedPrefs.getString(KEY_AI_API_KEY, "")
+
+        val input = android.widget.EditText(this).apply {
+            setText(current)
+            hint = "貼上你的 Google AI API Key"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 0)
+            addView(input)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("設定 Google AI API Key")
+            .setMessage("到 Google AI Studio (aistudio.google.com) 建立並取得 API Key 後貼在這裡，僅儲存在本機裝置上。")
+            .setView(container)
+            .setPositiveButton("儲存") { _, _ ->
+                sharedPrefs.edit().putString(KEY_AI_API_KEY, input.text.toString().trim()).apply()
+                Toast.makeText(this, "已儲存 API Key", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun showIgnoreKeywordsDialog() {
+        val sharedPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val current = sharedPrefs.getString(KEY_IGNORE_KEYWORDS, DEFAULT_IGNORE_KEYWORDS)
+
+        val input = android.widget.EditText(this).apply {
+            setText(current)
+            hint = "例如：直播,精華,全集,合集"
+        }
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 0)
+            addView(input)
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("編輯忽略清單")
+            .setMessage("標題命中以下任一關鍵字時，將不會播報（不分大小寫），請用逗號分隔多組關鍵字。")
+            .setView(container)
+            .setPositiveButton("儲存") { _, _ ->
+                sharedPrefs.edit().putString(KEY_IGNORE_KEYWORDS, input.text.toString()).apply()
+                Toast.makeText(this, "已儲存忽略清單", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("取消", null)
             .show()

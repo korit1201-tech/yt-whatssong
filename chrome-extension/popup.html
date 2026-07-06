@@ -5,8 +5,8 @@
     <meta charset="UTF-8">
     <style>
         body {
-            width: 280px;
-            padding: 10px;
+            width: 320px;
+            padding: 12px;
             font-family: "Microsoft JhengHei", "Segoe UI", sans-serif;
             background-color: #f5f5f5;
             color: #333;
@@ -15,20 +15,20 @@
         .container {
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            gap: 10px;
         }
 
         .header {
             font-size: 18px;
             font-weight: bold;
             color: #d32f2f;
-            margin-bottom: 5px;
+            margin-bottom: 2px;
             text-align: center;
         }
 
         .card {
             background: white;
-            padding: 10px;
+            padding: 10px 12px;
             border-radius: 8px;
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
             display: flex;
@@ -40,7 +40,6 @@
             font-size: 12px;
             font-weight: bold;
             color: #888;
-            margin-bottom: 4px;
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
@@ -49,6 +48,7 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
+            gap: 10px;
         }
 
         .row.column-layout {
@@ -65,12 +65,19 @@
         label {
             cursor: pointer;
             font-size: 14px;
+            line-height: 1.3;
         }
 
         .text-sm {
             font-size: 11px;
             color: #777;
             margin-top: 2px;
+        }
+
+        .divider {
+            height: 1px;
+            background-color: #eee;
+            margin: 2px 0;
         }
 
         textarea {
@@ -91,19 +98,39 @@
             border-radius: 4px;
         }
 
+        input[type="text"],
+        input[type="password"] {
+            width: 100%;
+            padding: 6px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-family: inherit;
+            font-size: 12px;
+            box-sizing: border-box;
+        }
+
+        button {
+            padding: 6px 10px;
+            border: 1px solid #d32f2f;
+            border-radius: 4px;
+            background: white;
+            color: #d32f2f;
+            font-size: 12px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background: #d32f2f;
+            color: white;
+        }
+
         .status {
             font-size: 12px;
             color: #666;
             text-align: center;
             padding-top: 5px;
-            margin-top: 5px;
+            margin-top: 2px;
             border-top: 1px solid #eee;
-        }
-
-        .divider {
-            height: 1px;
-            background-color: #eee;
-            margin: 2px 0;
         }
 
         #historyContainer {
@@ -116,11 +143,57 @@
             overflow-y: auto;
         }
 
+        .history-link {
+            color: #333;
+            text-decoration: none;
+        }
+
+        .history-link:hover {
+            color: #d32f2f;
+            text-decoration: underline;
+        }
+
         /* Disabled State for TTS Card */
         .card.disabled {
             opacity: 0.5;
             pointer-events: none;
             filter: grayscale(100%);
+        }
+
+        /* 進階設定收合區塊 */
+        details.card {
+            padding: 0;
+        }
+
+        details.card summary {
+            list-style: none;
+            cursor: pointer;
+            padding: 10px 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        details.card summary::-webkit-details-marker {
+            display: none;
+        }
+
+        details.card summary::after {
+            content: "▸";
+            color: #aaa;
+            font-size: 11px;
+            transition: transform 0.15s ease;
+        }
+
+        details.card[open] summary::after {
+            transform: rotate(90deg);
+        }
+
+        details.card .details-body {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            padding: 0 12px 10px;
         }
     </style>
 </head>
@@ -129,7 +202,7 @@
     <div class="container">
         <div class="header">YT WhatsSong 設定</div>
 
-        <!-- 全域開關 -->
+        <!-- 1. 總開關 -->
         <div class="card">
             <div class="row">
                 <label for="enableToggle" style="font-weight: bold;">啟用服務</label>
@@ -138,10 +211,62 @@
             <div class="status" id="statusText">...</div>
         </div>
 
-        <!-- 功能設定 -->
-        <!-- 功能設定 -->
+        <!-- 2. 語音與 DJ 播報（最常用，放最前面） -->
+        <div class="card" id="ttsSettings">
+            <div class="section-title">🎙 語音與播報</div>
+
+            <div class="row">
+                <label for="djModeToggle">
+                    DJ 輕柔模式
+                    <div class="text-sm">用輕柔語調 + DJ 風格開場白介紹歌曲（預設開啟）</div>
+                </label>
+                <input type="checkbox" id="djModeToggle">
+            </div>
+            <div class="divider"></div>
+            <div class="row">
+                <label for="resumeToggle">
+                    暫停恢復也播報
+                    <div class="text-sm">同一首歌從暫停恢復播放時，重新播報一次</div>
+                </label>
+                <input type="checkbox" id="resumeToggle">
+            </div>
+            <div class="divider"></div>
+            <div class="row column-layout">
+                <label for="voiceSelect">語音選擇 (Voice)</label>
+                <select id="voiceSelect"></select>
+            </div>
+            <div class="row column-layout">
+                <div class="flex-between">
+                    <label for="volumeRange">音量</label>
+                    <span id="volumeValue">30%</span>
+                </div>
+                <input type="range" id="volumeRange" min="0" max="3" step="1">
+            </div>
+            <div class="row column-layout">
+                <div class="flex-between">
+                    <label for="rateRange">語速</label>
+                    <span id="rateValue">1.0x</span>
+                </div>
+                <input type="range" id="rateRange" min="0.6" max="1.2" step="0.2">
+            </div>
+        </div>
+
+        <!-- 3. 歌曲辨識行為 -->
         <div class="card">
-            <div class="section-title">功能設定</div>
+            <div class="section-title">🎧 歌曲辨識</div>
+            <div class="row">
+                <label for="smartToggle">智慧標題優化</label>
+                <input type="checkbox" id="smartToggle">
+            </div>
+            <div class="divider"></div>
+            <div class="row">
+                <label for="itunesToggle">
+                    iTunes 標題優化
+                    <div class="text-sm">使用台灣 iTunes 資料庫，優先查詢（速度快）</div>
+                </label>
+                <input type="checkbox" id="itunesToggle">
+            </div>
+            <div class="divider"></div>
             <div class="row">
                 <label for="notificationToggle">
                     靜音通知模式
@@ -149,67 +274,48 @@
                 </label>
                 <input type="checkbox" id="notificationToggle">
             </div>
-            <div class="divider"></div>
-            <div class="row">
-                <label for="smartToggle">智慧標題優化</label>
-                <input type="checkbox" id="smartToggle">
+        </div>
+
+        <!-- 4. AI 加強（進階，預設收合） -->
+        <details class="card">
+            <summary class="section-title">🤖 Gemini AI 加強（進階）</summary>
+            <div class="details-body">
+                <div class="row">
+                    <label for="aiToggle">
+                        啟用 AI 查詢
+                        <div class="text-sm">iTunes 查無結果時才會問 AI，當備援使用</div>
+                    </label>
+                    <input type="checkbox" id="aiToggle">
+                </div>
+                <div class="divider"></div>
+                <div class="row column-layout">
+                    <label for="geminiApiKey">Google AI API Key</label>
+                    <input type="password" id="geminiApiKey" placeholder="貼上你的 API Key">
+                </div>
+                <div class="row column-layout">
+                    <label for="geminiModelInput">模型名稱</label>
+                    <input type="text" id="geminiModelInput" placeholder="gemma-4-31b-it">
+                </div>
+                <div class="row" style="gap: 8px;">
+                    <button id="testApiKeyBtn" style="flex: 1;">測試連線</button>
+                    <span id="apiStatus" class="text-sm"></span>
+                </div>
             </div>
-            <div class="row">
-                <label for="itunesToggle">
-                    iTunes 標題優化
-                    <div class="text-sm">使用台灣 iTunes 資料庫</div>
-                </label>
-                <input type="checkbox" id="itunesToggle">
+        </details>
+
+        <!-- 5. 忽略名單 -->
+        <div class="card">
+            <div class="section-title">🚫 忽略名單</div>
+            <textarea id="ignoreList" rows="2" placeholder="直播, 精華..."></textarea>
+        </div>
+
+        <!-- 6. 播放紀錄 -->
+        <div class="card">
+            <div class="section-title">🕘 最近播放</div>
+            <div id="historyContainer">
+                <div style="color: #999; text-align: center;">尚無紀錄</div>
             </div>
         </div>
-    </div>
-
-    <!-- 語音設定 (TTS) -->
-    <div class="card" id="ttsSettings">
-        <div class="section-title">語音設定</div>
-        <div class="row">
-            <label for="djModeToggle">
-                DJ 輕柔模式
-                <div class="text-sm">使用輕柔語調與像 DJ 般的介紹詞</div>
-            </label>
-            <input type="checkbox" id="djModeToggle">
-        </div>
-        <div class="divider"></div>
-        <div class="row column-layout">
-            <label for="voiceSelect">語音選擇 (Voice)</label>
-            <select id="voiceSelect"></select>
-        </div>
-
-        <div class="row column-layout">
-            <div class="flex-between">
-                <label for="volumeRange">音量</label>
-                <span id="volumeValue">30%</span>
-            </div>
-            <input type="range" id="volumeRange" min="0" max="3" step="1">
-        </div>
-
-        <div class="row column-layout">
-            <div class="flex-between">
-                <label for="rateRange">語速</label>
-                <span id="rateValue">1.0x</span>
-            </div>
-            <input type="range" id="rateRange" min="0.6" max="1.2" step="0.2">
-        </div>
-    </div>
-
-    <!-- 忽略名單 -->
-    <div class="card">
-        <div class="section-title">忽略名單</div>
-        <textarea id="ignoreList" rows="2" placeholder="直播, 精華..."></textarea>
-    </div>
-
-    <!-- 播放紀錄 -->
-    <div class="card">
-        <div class="section-title">最近播放</div>
-        <div id="historyContainer">
-            <div style="color: #999; text-align: center;">尚無紀錄</div>
-        </div>
-    </div>
     </div>
     <script src="popup.js"></script>
 </body>

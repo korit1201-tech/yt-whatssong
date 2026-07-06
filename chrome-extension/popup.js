@@ -11,8 +11,10 @@ document.addEventListener('DOMContentLoaded', () => {
     const volumeValue = document.getElementById('volumeValue');
     const rateValue = document.getElementById('rateValue');
     const djModeToggle = document.getElementById('djModeToggle');
+    const resumeToggle = document.getElementById('resumeToggle');
+    const aiToggle = document.getElementById('aiToggle');
     const geminiApiKey = document.getElementById('geminiApiKey');
-    const geminiModelSelect = document.getElementById('geminiModelSelect');
+    const geminiModelInput = document.getElementById('geminiModelInput');
     const testApiKeyBtn = document.getElementById('testApiKeyBtn');
     const apiStatus = document.getElementById('apiStatus');
 
@@ -25,13 +27,17 @@ document.addEventListener('DOMContentLoaded', () => {
     // edgeVoiceSelect removed
 
     // 載入目前設定
-    chrome.storage.local.get(['isEnabled', 'smartTitleParsing', 'useItunesApi', 'selectedVoiceURI', 'volume', 'playbackSpeed', 'notificationMode', 'ignoreList', 'history', 'djMode'], (result) => {
+    chrome.storage.local.get(['isEnabled', 'smartTitleParsing', 'useItunesApi', 'useAiApi', 'geminiApiKey', 'geminiModel', 'selectedVoiceURI', 'volume', 'playbackSpeed', 'notificationMode', 'ignoreList', 'history', 'djMode', 'announceOnResume'], (result) => {
         enableToggle.checked = result.isEnabled !== false;
         smartToggle.checked = result.smartTitleParsing !== false;
         itunesToggle.checked = result.useItunesApi !== false;
         notificationToggle.checked = result.notificationMode === true;
         ignoreList.value = result.ignoreList || "直播, 精華, 全集, 合集";
-        if (djModeToggle) djModeToggle.checked = result.djMode === true;
+        if (djModeToggle) djModeToggle.checked = result.djMode !== false;
+        if (resumeToggle) resumeToggle.checked = result.announceOnResume !== false;
+        if (aiToggle) aiToggle.checked = result.useAiApi === true;
+        if (geminiApiKey) geminiApiKey.value = result.geminiApiKey || "";
+        if (geminiModelInput) geminiModelInput.value = result.geminiModel || "gemma-4-31b-it";
 
         updateUIState();
 
@@ -87,6 +93,53 @@ document.addEventListener('DOMContentLoaded', () => {
     if (djModeToggle) {
         djModeToggle.addEventListener('change', () => {
             chrome.storage.local.set({ djMode: djModeToggle.checked });
+        });
+    }
+
+    if (resumeToggle) {
+        resumeToggle.addEventListener('change', () => {
+            chrome.storage.local.set({ announceOnResume: resumeToggle.checked });
+        });
+    }
+
+    if (aiToggle) {
+        aiToggle.addEventListener('change', () => {
+            chrome.storage.local.set({ useAiApi: aiToggle.checked });
+        });
+    }
+
+    if (geminiApiKey) {
+        geminiApiKey.addEventListener('change', () => {
+            chrome.storage.local.set({ geminiApiKey: geminiApiKey.value.trim() });
+        });
+    }
+
+    if (geminiModelInput) {
+        geminiModelInput.addEventListener('change', () => {
+            chrome.storage.local.set({ geminiModel: geminiModelInput.value.trim() || "gemma-4-31b-it" });
+        });
+    }
+
+    if (testApiKeyBtn) {
+        testApiKeyBtn.addEventListener('click', () => {
+            const apiKey = (geminiApiKey && geminiApiKey.value.trim()) || "";
+            const model = (geminiModelInput && geminiModelInput.value.trim()) || "gemma-4-31b-it";
+
+            if (apiStatus) {
+                apiStatus.textContent = "測試中...";
+                apiStatus.style.color = "#888";
+            }
+
+            chrome.runtime.sendMessage({ type: 'TEST_AI_KEY', apiKey, model }, (res) => {
+                if (!apiStatus) return;
+                if (chrome.runtime.lastError || !res) {
+                    apiStatus.textContent = "測試失敗：擴充功能通訊錯誤";
+                    apiStatus.style.color = "#d32f2f";
+                    return;
+                }
+                apiStatus.textContent = res.ok ? `✅ ${res.message}` : `❌ ${res.message}`;
+                apiStatus.style.color = res.ok ? "#4caf50" : "#d32f2f";
+            });
         });
     }
 
@@ -150,16 +203,32 @@ document.addEventListener('DOMContentLoaded', () => {
             return;
         }
 
-        history.forEach(song => {
-            const div = document.createElement('div');
-            div.textContent = song;
-            div.style.borderBottom = '1px solid #eee';
-            div.style.padding = '3px 0';
-            div.style.whiteSpace = 'nowrap';
-            div.style.overflow = 'hidden';
-            div.style.textOverflow = 'ellipsis';
-            div.title = song; // Tooltip
-            historyContainer.appendChild(div);
+        history.forEach(entry => {
+            // 相容舊格式（純字串）與新格式（{ title, url }）
+            const title = typeof entry === 'string' ? entry : entry.title;
+            const url = typeof entry === 'string' ? null : entry.url;
+
+            const row = document.createElement('div');
+            row.style.borderBottom = '1px solid #eee';
+            row.style.padding = '3px 0';
+            row.style.whiteSpace = 'nowrap';
+            row.style.overflow = 'hidden';
+            row.style.textOverflow = 'ellipsis';
+            row.title = title; // Tooltip
+
+            if (url) {
+                const link = document.createElement('a');
+                link.href = url;
+                link.target = '_blank';
+                link.rel = 'noopener';
+                link.textContent = title;
+                link.className = 'history-link';
+                row.appendChild(link);
+            } else {
+                row.textContent = title;
+            }
+
+            historyContainer.appendChild(row);
         });
     }
 

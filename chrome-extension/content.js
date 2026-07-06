@@ -4,21 +4,29 @@
 console.log("YT WhatsSong: AI DJ Content Script Loaded");
 
 let lastTitle = "";
-let config = { isEnabled: true };
+let config = { isEnabled: true, announceOnResume: true };
+
+// 同一首歌從暫停恢復播放時，至少要間隔這麼久才會再次觸發播報，避免快速連續暫停/播放造成洗版
+const RESUME_ANNOUNCE_COOLDOWN_MS = 2000;
+let isVideoPaused = false;
+let lastResumeAnnounceTime = 0;
 
 // 更新設定
 chrome.storage.onChanged.addListener((changes, namespace) => {
-    if (namespace === 'local' && changes.isEnabled) {
-        config.isEnabled = changes.isEnabled.newValue;
+    if (namespace === 'local') {
+        if (changes.isEnabled) config.isEnabled = changes.isEnabled.newValue;
+        if (changes.announceOnResume) config.announceOnResume = changes.announceOnResume.newValue;
     }
 });
 
-chrome.storage.local.get(['isEnabled'], (result) => {
+chrome.storage.local.get(['isEnabled', 'announceOnResume'], (result) => {
     config.isEnabled = result.isEnabled !== false;
+    config.announceOnResume = result.announceOnResume !== false;
 });
 
 // 啟動 DOM 監聽器
 const observer = new MutationObserver((mutations) => {
+    ensureVideoListeners();
     if (!config.isEnabled) return;
     checkTitleChange();
 });
@@ -83,6 +91,38 @@ function detectAds() {
     const adShowing = document.querySelector('.ad-showing');
     const adText = document.querySelector('.ytp-ad-text');
     return !!(adShowing || adText);
+}
+
+/**
+ * 確保目前的 <video> 元素上掛了 play/pause 監聽器，用來偵測「暫停恢復播放」事件。
+ * YouTube 在切換影片時通常會重用同一個 <video> 節點，但保險起見用 dataset 旗標避免重複掛載，
+ * 也讓這個函式可以在每次 DOM 變動時安全地重複呼叫。
+ */
+function ensureVideoListeners() {
+    const video = document.querySelector('video');
+    if (!video || video.dataset.whatssongListenerAttached) return;
+    video.dataset.whatssongListenerAttached = "true";
+
+    video.addEventListener('pause', () => {
+        isVideoPaused = true;
+    });
+
+    video.addEventListener('play', () => {
+        // 只有「明確從暫停恢復播放、且同一首歌、且沒有在播廣告」才算數，避免緩衝等暫態誤觸發
+        if (isVideoPaused && lastTitle && config.isEnabled && config.announceOnResume && !detectAds()) {
+            const now = Date.now();
+            if (now - lastResumeAnnounceTime >= RESUME_ANNOUNCE_COOLDOWN_MS) {
+                lastResumeAnnounceTime = now;
+                console.log(`偵測到恢復播放，重新播報: ${lastTitle}`);
+                try {
+                    chrome.runtime.sendMessage({ type: 'RESUME_ANNOUNCE', title: lastTitle });
+                } catch (e) {
+                    console.warn("YT WhatsSong: Extension context invalidated. Please refresh the page.");
+                }
+            }
+        }
+        isVideoPaused = false;
+    });
 }
 
 // 監聽 Background 的指令 (音量控制)
