@@ -19,3 +19,7 @@ local.properties
 # Keystore files
 *.jks
 *.keystore
+
+# Build artifacts — attached to GitHub Releases instead of committed to git
+*.apk
+chrome-extension/*.zip

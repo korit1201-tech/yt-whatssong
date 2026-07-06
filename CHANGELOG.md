@@ -2,7 +2,7 @@
 
 本專案的重大變更會記錄在這份文件中。格式參考 [Keep a Changelog](https://keepachangelog.com/zh-TW/1.0.0/)。
 
-## [Unreleased] - 2026-07-06
+## [1.1.0] - 2026-07-06
 
 ### 新增
 - **Gemini AI 備援查詢**（Android + Chrome 套件）：iTunes API 查無結果時，改問 Gemini AI 理解標題、忽略劇名/集數/MV 品牌等雜訊；三選一（本地標題簡化／iTunes／AI）互斥選擇。
