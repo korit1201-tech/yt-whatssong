@@ -457,10 +457,35 @@ class MainActivity : AppCompatActivity() {
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).unregisterOnSharedPreferenceChangeListener(prefsListener)
     }
 
+    // 程式化更新開關狀態時設為 true，讓監聽器忽略這次回呼。
+    // 沒有這道保險的話，單純「重新整理 UI」也會走進 setServiceState()，把使用者的開關意圖覆寫掉。
+    private var suppressToggleCallback = false
+
+    /**
+     * 狀態列文字。電池優化沒關掉時，服務隨時可能被系統凍結或殺掉，
+     * 而使用者從畫面上完全看不出來，所以直接寫在狀態列提醒。
+     */
+    private fun buildStatusText(isServiceRunning: Boolean): String {
+        val base = if (isServiceRunning) "服務正在運作中" else "服務已停用"
+        if (isServiceRunning && !isIgnoringBatteryOptimizations()) {
+            return "$base\n⚠ 尚未關閉電池優化，螢幕關閉後可能不會播報"
+        }
+        return base
+    }
+
+    private fun isIgnoringBatteryOptimizations(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+        val pm = getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+        return pm.isIgnoringBatteryOptimizations(packageName)
+    }
+
     private fun setupListeners() {
         serviceToggle.setOnCheckedChangeListener { _, isChecked ->
+            if (suppressToggleCallback) return@setOnCheckedChangeListener
             if (isChecked && !areAllPermissionsGranted()) {
+                suppressToggleCallback = true
                 serviceToggle.isChecked = false
+                suppressToggleCallback = false
                 Toast.makeText(this, "請先授予所有必要權限", Toast.LENGTH_SHORT).show()
                 checkPermissionsAndState()
                 return@setOnCheckedChangeListener
@@ -591,9 +616,11 @@ class MainActivity : AppCompatActivity() {
             speedSeekBar.isEnabled = false
             volumeSeekBar.isEnabled = false
         } else {
-            statusText.text = if (isServiceRunning) "服務正在運作中" else "服務已停用"
+            statusText.text = buildStatusText(isServiceRunning)
             serviceToggle.isEnabled = true
+            suppressToggleCallback = true
             serviceToggle.isChecked = isServiceRunning
+            suppressToggleCallback = false
             screenOnToggle.isEnabled = isServiceRunning
             resumeAnnounceToggle.isEnabled = isServiceRunning
             smartParsingToggle.isEnabled = isServiceRunning

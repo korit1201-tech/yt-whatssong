@@ -80,6 +80,34 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
     // 執行緒池，用於執行網路請求 (iTunes API)
     private val networkExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
     private lateinit var audioManager: AudioManager
+    // 正在查詢/播報中的標題。與 lastProcessedTitle 分開：前者代表「處理中」，後者代表「已成功播報」。
+    // 播報失敗時只清掉 inFlightTitle 而不寫入 lastProcessedTitle，同一首歌的下一則通知才有機會重試。
+    private var inFlightTitle: String? = null
+    // 線上查詢的世代編號。使用者換到下一首歌時遞增，讓還在路上的舊查詢結果自動作廢，避免播報上一首歌。
+    private var lookupGeneration = 0
+    // TTS 引擎重新初始化的重試次數（語音引擎被更新或重裝後，舊的 TextToSpeech 實例會永久失效）
+    private var ttsRestartAttempts = 0
+    // 通知監聽器重新綁定的重試次數，連線成功時歸零
+    private var rebindAttempts = 0
+    // MediaSession 監聽（換曲偵測的第二條路徑，見 startSessionWatch 的說明）
+    private var sessionManager: MediaSessionManager? = null
+    private val registeredControllers =
+        mutableMapOf<MediaSession.Token, Pair<MediaController, MediaController.Callback>>()
+    private val sessionsChangedListener =
+        MediaSessionManager.OnActiveSessionsChangedListener { controllers ->
+            syncSessionCallbacks(controllers)
+        }
+
+    /**
+     * 安全網：播報流程若因為非預期的例外中途斷掉，[inFlightTitle] 會一直卡著，
+     * 導致這首歌之後的所有通知都被當成「處理中」而跳過。這個 watchdog 會把它清掉。
+     */
+    private val clearInFlightTask = Runnable {
+        if (inFlightTitle != null) {
+            Log.w(TAG, "播報流程逾時未收尾，清除 inFlightTitle: $inFlightTitle")
+            inFlightTitle = null
+        }
+    }
 
     // DJ 播報適用的時段。用裝置目前的本地時間判斷，避免「深夜電台」這類台詞在大白天被播出來
     private enum class DjTimeSlot { MORNING, AFTERNOON, EVENING, NIGHT }
@@ -220,6 +248,23 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
         private const val TARGET_PKG_YOUTUBE = "com.google.android.youtube"
         // 目標監控套件：ReVanced
         private const val TARGET_PKG_REVANCED = "app.revanced.android.youtube"
+
+        /**
+         * 使用者沒有自訂監控清單時的預設監控對象。
+         *
+         * ReVanced 有兩套並存的套件命名：官方 ReVanced 用 `app.revanced.*`，
+         * 而流傳更廣的 ReVanced Extended (RVX) 用 `app.rvx.*`。舊版只列了前者，
+         * 於是用 RVX 播放的歌曲完全不會被視為監控對象，一句都不會播報。
+         */
+        private val DEFAULT_TARGET_PACKAGES = setOf(
+            TARGET_PKG_YOUTUBE,
+            TARGET_PKG_REVANCED,
+            "app.rvx.android.youtube",                  // ReVanced Extended - YouTube
+            "com.google.android.apps.youtube.music",
+            "app.revanced.android.apps.youtube.music",  // ReVanced - YouTube Music
+            "app.rvx.android.apps.youtube.music",       // ReVanced Extended - YouTube Music
+            "com.spotify.music"
+        )
         // 智慧重試（括號關鍵字）的最大遞迴深度，避免無限遞迴（iTunes 專用）
         private const val MAX_API_RETRY_DEPTH = 1
         // 候選結果與原標題的最低相似度門檻，低於此分數視為無把握、放棄配對（iTunes 專用）
@@ -234,6 +279,19 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
         // AI 推論通常比 iTunes 慢，給比較長的逾時時間
         private const val AI_CONNECT_TIMEOUT_MS = 5000
         private const val AI_READ_TIMEOUT_MS = 10000
+        // 線上查詢（iTunes/AI）的總逾時。超過就先用本地標題解析播報，
+        // 避免網路慢的時候整首歌都播完了才聽到播報。
+        private const val LOOKUP_TIMEOUT_MS = 4000L
+        // inFlightTitle 的安全清除時間，必須大於 LOOKUP_TIMEOUT_MS 加上 TTS 播報時間
+        private const val IN_FLIGHT_WATCHDOG_MS = 20000L
+        // TTS 引擎失效後重新初始化的最多嘗試次數與基礎延遲
+        private const val MAX_TTS_RESTART_ATTEMPTS = 3
+        private const val TTS_RESTART_BASE_DELAY_MS = 2000L
+        // 通知監聽器斷線後重新綁定的最多嘗試次數與基礎延遲（第 n 次等 n * BASE 毫秒）
+        private const val MAX_REBIND_ATTEMPTS = 5
+        private const val REBIND_BASE_DELAY_MS = 5000L
+        // 主動輪詢 MediaSession 的間隔（換曲偵測的第三條路徑，見 pollTask 的說明）
+        private const val SESSION_POLL_INTERVAL_MS = 15000L
     }
 
     override fun onCreate() {
@@ -241,26 +299,26 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
         Log.i(TAG, "onCreate: 服務正在建立。")
         sharedPrefs = getSharedPreferences(MainActivity.PREFS_NAME, Context.MODE_PRIVATE)
 
-        // [修正4] 重開機不自動啟動：檢查服務開關狀態
-        // 如果使用者之前關閉了服務，這裡就不應該啟動前景通知與 TTS
+        // 這些資源不論服務開關與否都要初始化。
+        // 之前這裡在服務停用時直接 return，導致 tts / wakeLock / audioManager 全部沒建立；
+        // 而系統綁定通知監聽器時只會呼叫一次 onCreate，使用者稍後把開關打開走的是 onStartCommand，
+        // 於是服務「活著、通知也在，但 isTtsReady 永遠是 false」，所有歌都被丟進佇列、一句都不會播。
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Whatssong::WakelockTag")
+        wakeLock?.setReferenceCounted(false) // 手動管理釋放
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        tts = TextToSpeech(this, this)
+
+        // [修正4] 重開機不自動啟動：服務被使用者關閉時，不要佔用前景通知
         val isServiceEnabled = sharedPrefs.getBoolean(MainActivity.KEY_SERVICE_ENABLED, true)
         if (!isServiceEnabled) {
-            Log.i(TAG, "onCreate: 服務被設為停用，不進行初始化。")
+            Log.i(TAG, "onCreate: 服務被設為停用，不啟動前景通知。")
             return
         }
 
         // **修正點**: 在 onCreate 中立即啟動前景服務通知。
         // 這是防止服務被系統殺死的關鍵步驟。
         updateNotification("正在背景監控媒體播放")
-
-        // 初始化電源鎖 (WakeLock)
-        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Whatssong::WakelockTag")
-        wakeLock?.setReferenceCounted(false) // 手動管理釋放
-
-        // 初始化文字轉語音引擎
-        tts = TextToSpeech(this, this)
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -271,6 +329,8 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
 
             // [修正] 更新 SharedPreferences，讓 MainActivity 知道服務已關閉
             sharedPrefs.edit().putBoolean(MainActivity.KEY_SERVICE_ENABLED, false).apply()
+
+            stopSessionWatch()
 
             // 1. 立即移除通知並停止前景服務狀態
             stopForeground(true)
@@ -295,6 +355,7 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
         // 服務在 onCreate 時已經啟動了前景通知。
         // 但如果服務被系統重啟，我們需要再次確認前景狀態。
         updateNotification("正在背景監控媒體播放")
+        startSessionWatch()
 
         // 強制請求重新綁定通知監聽器 (解決服務意外重啟後失效的問題)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
@@ -305,7 +366,11 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
              } catch (e: Exception) { /* 忽略錯誤 */ }
         }
 
-        return START_REDELIVER_INTENT
+        // 用 START_STICKY 而非 START_REDELIVER_INTENT：後者會在服務被系統殺掉後
+        // 把「最後一個尚未以 stopSelf(startId) 標記完成的 Intent」重新投遞，
+        // 而本服務從來沒有呼叫過 stopSelf(startId)，等於讓舊指令（含關閉指令）有機會被重播。
+        // 這裡的 Intent 不帶任何狀態，重啟時重新讀 SharedPreferences 即可。
+        return START_STICKY
     }
 
     /**
@@ -336,11 +401,13 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
     override fun onListenerConnected() {
         super.onListenerConnected()
         Log.i(TAG, "onListenerConnected: 通知監聽器已連線。")
+        rebindAttempts = 0
 
         // [修正4] 重開機確認狀態，若為關閉則解除綁定
         val isServiceEnabled = sharedPrefs.getBoolean(MainActivity.KEY_SERVICE_ENABLED, true)
         if (!isServiceEnabled) {
              Log.i(TAG, "onListenerConnected: 服務停用中，請求 Unbind。")
+             stopSessionWatch()
              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                  requestUnbind()
              }
@@ -348,21 +415,60 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
         }
 
         updateNotification("服務已連線，準備監控")
+        startSessionWatch()
     }
 
     override fun onListenerDisconnected() {
         super.onListenerDisconnected()
         Log.w(TAG, "onListenerDisconnected: 通知監聽器已中斷連線。")
-        // [注意] 此處不請求 Rebind，避免造成無限重啟迴圈。
-        // 我們只在使用者顯式開啟服務時請求 Rebind。
+
+        // 服務被系統（或 ColorOS/MIUI 這類廠商省電機制）殺掉時會走到這裡。
+        // 舊版完全不重新綁定，於是監聽器就此失效，要等使用者手動開 App 或系統剛好重綁才會恢復——
+        // 這正是「螢幕關著沒聲音、開螢幕或換歌才突然有」的來源。
+        //
+        // 為了避免無限重啟迴圈，這裡加上遞增退避與次數上限；服務被使用者關閉時則不重綁。
+        val isServiceEnabled = sharedPrefs.getBoolean(MainActivity.KEY_SERVICE_ENABLED, true)
+        if (!isServiceEnabled) {
+            Log.i(TAG, "onListenerDisconnected: 服務停用中，不重新綁定。")
+            return
+        }
+        scheduleRebind()
+    }
+
+    /**
+     * 以遞增退避請求重新綁定通知監聽器。連線成功時 [onListenerConnected] 會把計數歸零。
+     */
+    private fun scheduleRebind() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) return
+        if (rebindAttempts >= MAX_REBIND_ATTEMPTS) {
+            Log.e(TAG, "scheduleRebind: 已達重綁上限 ($MAX_REBIND_ATTEMPTS 次)，放棄自動恢復。")
+            return
+        }
+        rebindAttempts++
+        val delay = REBIND_BASE_DELAY_MS * rebindAttempts
+        Log.i(TAG, "scheduleRebind: ${delay}ms 後請求第 $rebindAttempts 次重新綁定。")
+        mainHandler.postDelayed({
+            try {
+                NotificationListenerService.requestRebind(ComponentName(this, MediaMonitorService::class.java))
+            } catch (e: Exception) {
+                Log.e(TAG, "scheduleRebind: requestRebind 失敗。", e)
+            }
+        }, delay)
     }
 
     override fun onDestroy() {
         Log.w(TAG, "onDestroy: 服務正在銷毀。")
+        stopSessionWatch()
+        // 服務被銷毀後這些延遲任務再跑起來只會操作到已失效的實例
+        mainHandler.removeCallbacksAndMessages(null)
         releaseWakeLock()
         tts?.stop()
         tts?.shutdown()
+        tts = null
+        isTtsReady = false
         controllerMap.clear()
+        ttsQueue.clear()
+        inFlightTitle = null
         networkExecutor.shutdown()
         super.onDestroy()
     }
@@ -370,6 +476,7 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
             isTtsReady = true
+            ttsRestartAttempts = 0
             Log.i(TAG, "onInit: TTS 初始化成功。")
 
             // Voice Selection Logic
@@ -388,22 +495,30 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
             }
 
             if (targetVoice == null && useGoogleVoice) {
-                // Priority 2: Auto Optimization (Default Gentle Female)
-                // Look for "zh-TW" and "Network" (High Quality) or at least "Google"
-                targetVoice = voices?.find {
+                // 自動挑選語音：**離線語音優先**。
+                //
+                // 舊版優先挑名稱含 "network" 的 Google 高品質語音，但那種語音每唸一句都要即時連網取音檔。
+                // 螢幕關閉、裝置進入 Doze 之後系統會切斷背景 App 的網路，於是 TTS 整句唸不出來——
+                // 這正是「螢幕關著沒聲音、一開螢幕就有」的主因。本 App 的使用情境幾乎都在螢幕關閉時，
+                // 所以寧可用音質稍差但一定唸得出來的離線語音，網路語音只留作最後備援。
+                val zhVoices = voices.orEmpty().filter {
                     it.locale.language == Locale.TRADITIONAL_CHINESE.language &&
-                    (it.name.contains("google", ignoreCase = true) && it.name.contains("network", ignoreCase = true))
+                    !it.features.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED)
                 }
 
-                // Fallback: If no network voice, just find any Google voice
-                if (targetVoice == null) {
-                     targetVoice = voices?.find {
-                        it.locale.language == Locale.TRADITIONAL_CHINESE.language &&
-                        it.name.contains("google", ignoreCase = true)
-                    }
-                }
+                fun pick(predicate: (android.speech.tts.Voice) -> Boolean) = zhVoices.firstOrNull(predicate)
 
-                if (targetVoice != null) Log.i(TAG, "onInit: 自動選擇優化語音: ${targetVoice.name}")
+                targetVoice =
+                    pick { !it.isNetworkConnectionRequired && it.locale.country == "TW" && it.name.contains("google", ignoreCase = true) }
+                        ?: pick { !it.isNetworkConnectionRequired && it.locale.country == "TW" }
+                        ?: pick { !it.isNetworkConnectionRequired && it.name.contains("google", ignoreCase = true) }
+                        ?: pick { !it.isNetworkConnectionRequired }
+                        ?: pick { it.locale.country == "TW" }
+                        ?: zhVoices.firstOrNull()
+
+                if (targetVoice != null) {
+                    Log.i(TAG, "onInit: 自動選擇語音: ${targetVoice.name} (需要網路=${targetVoice.isNetworkConnectionRequired})")
+                }
             }
 
             if (targetVoice != null) {
@@ -437,52 +552,88 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
                 handleMediaEvent(title, controller)
             }
         } else {
+            isTtsReady = false
             Log.e(TAG, "onInit: TTS 初始化失敗，錯誤代碼: $status")
+            scheduleTtsRestart()
         }
+    }
+
+    /**
+     * 重新建立 TextToSpeech 實例。
+     *
+     * 語音引擎（通常是 Google TTS）被 Play 商店更新或重新安裝之後，舊的 TextToSpeech 實例會永久失效：
+     * speak() 一律回傳 ERROR，而且不會有任何回呼通知。舊版沒有任何重試，服務就此變成啞巴，
+     * 只能靠重開機或重開服務恢復。這裡以遞增退避重建，成功後 [onInit] 會把計數歸零。
+     */
+    private fun scheduleTtsRestart() {
+        if (ttsRestartAttempts >= MAX_TTS_RESTART_ATTEMPTS) {
+            Log.e(TAG, "scheduleTtsRestart: 已達重試上限，放棄重建 TTS。")
+            updateNotification("語音引擎無法初始化，請檢查系統 TTS 設定")
+            return
+        }
+        ttsRestartAttempts++
+        val delay = TTS_RESTART_BASE_DELAY_MS * ttsRestartAttempts
+        Log.w(TAG, "scheduleTtsRestart: ${delay}ms 後重建 TTS（第 $ttsRestartAttempts 次）。")
+        mainHandler.postDelayed({
+            try { tts?.shutdown() } catch (e: Exception) { Log.w(TAG, "shutdown 舊 TTS 失敗", e) }
+            isTtsReady = false
+            tts = TextToSpeech(this, this)
+        }, delay)
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         if (sbn == null) return
-
-        // [安全機制] 檢查服務是否在 App 設定中被啟用
-        val isServiceEnabled = sharedPrefs.getBoolean(MainActivity.KEY_SERVICE_ENABLED, true)
-        if (!isServiceEnabled) {
-             return
-        }
+        if (!isServiceEnabled()) return
 
         val packageName = sbn.packageName
-
-        // [修改] 檢查是否為監控對象
-        val monitoredApps = sharedPrefs.getStringSet(MainActivity.KEY_MONITORED_APPS, null)
-        val isTargetApp = if (monitoredApps.isNullOrEmpty()) {
-            // Default targets if user hasn't selected any (or accidentally saved empty list)
-            packageName == TARGET_PKG_YOUTUBE ||
-            packageName == TARGET_PKG_REVANCED ||
-            packageName == "com.google.android.apps.youtube.music" ||
-            packageName == "com.spotify.music"
-        } else {
-            monitoredApps.contains(packageName)
-        }
-
-        if (!isTargetApp) return
+        if (!isMonitoredPackage(packageName)) return  // 非監控對象，量太大不記 log
 
         val extras = sbn.notification.extras
         val title = extras.getString(Notification.EXTRA_TITLE)
+        Log.d(TAG, "來源=通知 pkg=$packageName title=\"$title\"")
 
+        processSongEvent(packageName, title, findMediaController(packageName, extras))
+    }
+
+    /**
+     * 服務是否在 App 設定中被啟用。
+     */
+    private fun isServiceEnabled(): Boolean =
+        sharedPrefs.getBoolean(MainActivity.KEY_SERVICE_ENABLED, true)
+
+    /**
+     * 這個套件是否在監控清單內。使用者沒有自訂清單時採用 [DEFAULT_TARGET_PACKAGES]。
+     */
+    private fun isMonitoredPackage(packageName: String): Boolean {
+        val monitoredApps = sharedPrefs.getStringSet(MainActivity.KEY_MONITORED_APPS, null)
+        return if (monitoredApps.isNullOrEmpty()) {
+            DEFAULT_TARGET_PACKAGES.contains(packageName)
+        } else {
+            monitoredApps.contains(packageName)
+        }
+    }
+
+    /**
+     * 換曲事件的共用處理路徑，[onNotificationPosted] 與 MediaSession 回呼都匯流到這裡，
+     * 因此兩條來源共用同一套過濾條件與去重狀態（[inFlightTitle] / [lastProcessedTitle]），
+     * 同一首歌不論由哪一邊先偵測到，都只會播報一次。
+     */
+    private fun processSongEvent(packageName: String, title: String?, controller: MediaController?) {
         val announceWhenScreenOn = sharedPrefs.getBoolean(MainActivity.KEY_ANNOUNCE_SCREEN_ON, true)
         if (!isScreenOff() && !announceWhenScreenOn) {
+            Log.d(TAG, "略過: 螢幕開啟中且設定為不播報")
             // [Debug] 讓使用者知道服務活著，只是因為螢幕亮著而暫停播報
             updateNotification("暫停播報 (螢幕開啟中)")
             return // 螢幕開啟且設定不播報，則忽略
         }
 
         if (title == null || isHardIgnored(title)) {
+            Log.d(TAG, "略過: 標題為空或命中忽略清單 (title=$title)")
             return
         }
 
-        val controller = findMediaController(packageName, extras)
         if (controller == null) {
-            Log.w(TAG, "onNotificationPosted: 找不到 MediaController。")
+            Log.w(TAG, "processSongEvent: 找不到 MediaController。")
             return
         }
 
@@ -491,10 +642,13 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
         val playbackState = controller.playbackState
         val currentState = playbackState?.state ?: PlaybackState.STATE_NONE
         val previousState = lastPlaybackStateMap[packageName]
-        lastPlaybackStateMap[packageName] = currentState
+        // 只有播放器真的回報了狀態才記錄，避免 null 汙染後續「暫停 -> 播放」的判斷
+        if (playbackState != null) lastPlaybackStateMap[packageName] = currentState
 
-        if (currentState != PlaybackState.STATE_PLAYING) {
-            // Log.d(TAG, "忽略非播放狀態: $currentState")
+        // playbackState 為 null 代表播放器還沒設定播放狀態（換歌瞬間、Spotify/ReVanced 很常見）。
+        // 0.1.0 在這種情況是照樣播報的，1.1.0 改成一律跳過，整首歌就這樣被吃掉。這裡恢復舊行為。
+        if (playbackState != null && currentState != PlaybackState.STATE_PLAYING) {
+            Log.d(TAG, "略過: 非播放狀態 (state=$currentState, prev=$previousState)")
             return
         }
 
@@ -506,12 +660,156 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
             (previousState == PlaybackState.STATE_PAUSED || previousState == PlaybackState.STATE_STOPPED) &&
             (System.currentTimeMillis() - lastProcessedTime) >= RESUME_ANNOUNCE_COOLDOWN_MS
 
+        if (title == inFlightTitle) {
+            // 這首歌正在查詢或播報中。媒體通知每秒都可能重發，這裡直接略過避免重複觸發。
+            Log.d(TAG, "略過: 這首歌正在處理中")
+            return
+        }
+
         if (title == lastProcessedTitle && !isResumeOfSameSong) {
             // 同一首歌、且不構成一次有效的「恢復播放」事件，略過避免重複播報
+            Log.d(TAG, "略過: 與上一首已播報的標題相同")
             return
         }
 
         handleMediaEvent(title, controller, isResumeOfSameSong)
+    }
+
+    // ---------------------------------------------------------------------
+    // MediaSession 監聽：獨立於通知監聽器的第二條換曲偵測路徑
+    // ---------------------------------------------------------------------
+
+    /**
+     * 啟動 MediaSession 監聽。
+     *
+     * 為什麼需要這條路：實測發現部分廠商 ROM（例如 ColorOS）在螢幕關閉、App 閒置數分鐘後，
+     * 會停止把 onNotificationPosted 派送給第三方通知監聽器——此時系統的通知紀錄確實已更新、
+     * App 程序也活著沒被凍結，但回呼就是不進來，於是整首歌沒有播報，直到使用者點亮螢幕才補上。
+     *
+     * MediaSession 的回呼由 media_session 服務派送，與通知監聽器是完全不同的 IPC 路徑，
+     * 因此可作為換曲偵測的備援。兩條路都會匯流到 [processSongEvent]，由既有的去重邏輯確保只播報一次。
+     */
+    private fun startSessionWatch() {
+        if (sessionManager != null) return
+        try {
+            val msm = getSystemService(Context.MEDIA_SESSION_SERVICE) as MediaSessionManager
+            val component = ComponentName(this, MediaMonitorService::class.java)
+            msm.addOnActiveSessionsChangedListener(sessionsChangedListener, component, mainHandler)
+            sessionManager = msm
+            syncSessionCallbacks(msm.getActiveSessions(component))
+            mainHandler.removeCallbacks(pollTask)
+            mainHandler.postDelayed(pollTask, SESSION_POLL_INTERVAL_MS)
+            Log.i(TAG, "startSessionWatch: 已開始監聽 MediaSession（含 ${SESSION_POLL_INTERVAL_MS}ms 輪詢）。")
+        } catch (e: SecurityException) {
+            // 沒有通知存取權限時會拋這個，屬於預期情形（此時通知監聽器也不會運作）
+            Log.e(TAG, "startSessionWatch: 缺少通知存取權限，無法監聽 MediaSession。", e)
+        } catch (e: Exception) {
+            Log.e(TAG, "startSessionWatch: 監聽 MediaSession 失敗。", e)
+        }
+    }
+
+    private fun stopSessionWatch() {
+        mainHandler.removeCallbacks(pollTask)
+        try {
+            sessionManager?.removeOnActiveSessionsChangedListener(sessionsChangedListener)
+        } catch (e: Exception) {
+            Log.w(TAG, "stopSessionWatch: 移除監聽器失敗。", e)
+        }
+        sessionManager = null
+        registeredControllers.values.forEach { (controller, callback) ->
+            try { controller.unregisterCallback(callback) } catch (e: Exception) { /* 忽略 */ }
+        }
+        registeredControllers.clear()
+    }
+
+    /**
+     * 依目前的活躍 session 清單，補上新出現的監控對象、移除已消失的，維持回呼註冊與現況一致。
+     */
+    private fun syncSessionCallbacks(controllers: List<MediaController>?) {
+        val targets = controllers.orEmpty().filter { isMonitoredPackage(it.packageName) }
+        val liveTokens = targets.map { it.sessionToken }.toSet()
+
+        registeredControllers.keys.toList()
+            .filterNot { liveTokens.contains(it) }
+            .forEach { token ->
+                registeredControllers.remove(token)?.let { (controller, callback) ->
+                    try { controller.unregisterCallback(callback) } catch (e: Exception) { /* 忽略 */ }
+                    Log.i(TAG, "syncSessionCallbacks: 已解除 ${controller.packageName} 的回呼。")
+                }
+            }
+
+        targets.forEach { controller ->
+            if (registeredControllers.containsKey(controller.sessionToken)) return@forEach
+            val callback = object : MediaController.Callback() {
+                override fun onMetadataChanged(metadata: android.media.MediaMetadata?) {
+                    onSessionUpdate(controller, metadata)
+                }
+
+                override fun onPlaybackStateChanged(state: PlaybackState?) {
+                    onSessionUpdate(controller, controller.metadata)
+                }
+
+                override fun onSessionDestroyed() {
+                    registeredControllers.remove(controller.sessionToken)
+                    Log.i(TAG, "MediaSession 已銷毀: ${controller.packageName}")
+                }
+            }
+            try {
+                controller.registerCallback(callback, mainHandler)
+                registeredControllers[controller.sessionToken] = controller to callback
+                Log.i(TAG, "syncSessionCallbacks: 已註冊 ${controller.packageName} 的 MediaSession 回呼。")
+            } catch (e: Exception) {
+                Log.e(TAG, "syncSessionCallbacks: 註冊 ${controller.packageName} 回呼失敗。", e)
+            }
+        }
+    }
+
+    /**
+     * 主動輪詢目前的活躍 MediaSession，作為換曲偵測的第三條路徑。
+     *
+     * 通知監聽器與 MediaSession 回呼都是「系統推給我們」的被動路徑，實測在部分廠商 ROM 上
+     * 螢幕關閉一段時間後兩者會同時停止派送。這個輪詢改由 App 主動去問，只要程序還能執行就抓得到換曲。
+     *
+     * 每次執行都會留下一行 log，因此這條輪詢同時是判斷「程序究竟是被凍結、還是只有回呼被擋掉」的依據：
+     * log 斷掉代表程序沒在跑，log 持續代表程序活著、只是收不到推送。
+     *
+     * 重複的標題會被 [processSongEvent] 既有的去重邏輯擋掉，不會造成重複播報。
+     */
+    private val pollTask = object : Runnable {
+        override fun run() {
+            pollActiveSessions()
+            mainHandler.postDelayed(this, SESSION_POLL_INTERVAL_MS)
+        }
+    }
+
+    private fun pollActiveSessions() {
+        val msm = sessionManager ?: return
+        if (!isServiceEnabled()) return
+        try {
+            val controllers = msm.getActiveSessions(ComponentName(this, MediaMonitorService::class.java))
+            // 順便補註冊/清理回呼，session 換人時不必等系統通知我們
+            syncSessionCallbacks(controllers)
+
+            val targets = controllers.filter { isMonitoredPackage(it.packageName) }
+            Log.d(TAG, "輪詢: 活躍 session=${controllers.size} 監控中=${targets.size}")
+
+            targets.forEach { controller ->
+                val title = controller.metadata?.getString(android.media.MediaMetadata.METADATA_KEY_TITLE)
+                if (!title.isNullOrBlank()) {
+                    processSongEvent(controller.packageName, title, controller)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "pollActiveSessions: 輪詢失敗。", e)
+        }
+    }
+
+    private fun onSessionUpdate(controller: MediaController, metadata: android.media.MediaMetadata?) {
+        if (!isServiceEnabled()) return
+        val title = metadata?.getString(android.media.MediaMetadata.METADATA_KEY_TITLE)
+        if (title.isNullOrBlank()) return
+        Log.d(TAG, "來源=MediaSession pkg=${controller.packageName} title=\"$title\"")
+        processSongEvent(controller.packageName, title, controller)
     }
 
     private fun findMediaController(packageName: String, extras: Bundle): MediaController? {
@@ -565,24 +863,30 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
 
     private fun handleMediaEvent(title: String, controller: MediaController, isResumeAnnounce: Boolean = false) {
         Log.i(TAG, "handleMediaEvent: 正在處理 \"$title\" (resume=$isResumeAnnounce)。")
-        lastProcessedTitle = title
-        lastProcessedTime = System.currentTimeMillis()
 
         if (!isTtsReady) {
-            Log.w(TAG, "handleMediaEvent: TTS 尚未準備好，加入佇列。")
+            // 只保留最新一首：TTS 就緒後把積了好幾首的舊歌一次唸完沒有意義，只會洗版。
+            Log.w(TAG, "handleMediaEvent: TTS 尚未準備好，先記住這首歌。")
+            ttsQueue.clear()
             ttsQueue.add(Pair(title, controller))
+            inFlightTitle = null
+            if (tts == null) scheduleTtsRestart()
             return
         }
+
+        // 標記為「處理中」。這裡刻意不寫 lastProcessedTitle：
+        // 舊版一進來就把標題記成已處理，只要後面任何一步失敗（TTS 沒就緒、speak 回傳 ERROR、
+        // 網路例外），這首歌就被永久當成播過了，使用者必須換歌才可能再聽到播報。
+        inFlightTitle = title
+        mainHandler.removeCallbacks(clearInFlightTask)
+        mainHandler.postDelayed(clearInFlightTask, IN_FLIGHT_WATCHDOG_MS)
 
         acquireWakeLock()
 
         // [新功能] 暫停恢復播放：直接沿用上次查到的 metadata 重新播報，不必再打一次網路請求，
         // 這樣恢復播放後幾乎能立即播報，也不會因為網路狀況給出不同的配對結果。
         if (isResumeAnnounce) {
-            val metadata = lastMetadata ?: extractMetadataFromLocalTitle(title)
-            val textToSpeak = generateSpeechText(metadata)
-            updateNotification("恢復播放，重新播報: $textToSpeak")
-            speakTitle(textToSpeak, controller)
+            announceMetadata(title, lastMetadata ?: extractMetadataFromLocalTitle(title), controller, "恢復播放，重新播報")
             return
         }
 
@@ -607,12 +911,33 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
             useItunesApi -> performApiLookupAndSpeak(title, controller) { fetchTitleFromiTunes(it) }
             else -> {
                 val titleToProcess = if (useSmartParsing) parseTitle(title) else title
-                val metadata = extractMetadataFromLocalTitle(titleToProcess)
-                lastMetadata = metadata
-                val textToSpeak = generateSpeechText(metadata)
-                updateNotification("正在播報: $textToSpeak")
-                speakTitle(textToSpeak, controller)
+                announceMetadata(title, extractMetadataFromLocalTitle(titleToProcess), controller)
             }
+        }
+    }
+
+    /**
+     * 統一的播報收尾：產生台詞、送進 TTS，並且**只有真的送成功**才把標題記為已播報。
+     * 失敗時只清掉 [inFlightTitle]，讓同一首歌的下一則媒體通知還有機會重試。
+     */
+    private fun announceMetadata(
+        title: String,
+        metadata: SongMetadata,
+        controller: MediaController,
+        noticePrefix: String = "正在播報"
+    ) {
+        lastMetadata = metadata
+        val textToSpeak = generateSpeechText(metadata)
+        updateNotification("$noticePrefix: $textToSpeak")
+
+        val success = speakTitle(textToSpeak, controller)
+        mainHandler.removeCallbacks(clearInFlightTask)
+        inFlightTitle = null
+        if (success) {
+            lastProcessedTitle = title
+            lastProcessedTime = System.currentTimeMillis()
+        } else {
+            Log.w(TAG, "announceMetadata: 播報失敗，不記錄 lastProcessedTitle，保留重試機會。")
         }
     }
 
@@ -621,6 +946,20 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
      * 查無把握的結果或發生例外時，退回本地標題解析作為備援，最後統一在主執行緒播報。
      */
     private fun performApiLookupAndSpeak(title: String, controller: MediaController, fetcher: (String) -> SongMetadata?) {
+        val generation = ++lookupGeneration
+        val answered = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        // 線上查詢最多等 LOOKUP_TIMEOUT_MS。iTunes 會依序試 TW/US 兩個地區、各自還有連線與讀取逾時，
+        // 而且所有查詢共用同一條 networkExecutor 執行緒，網路差的時候整首歌都播完了才會聽到播報。
+        // 逾時就先用本地標題解析播報，寧可資訊少一點也不要遲到。
+        val timeoutTask = Runnable {
+            if (generation != lookupGeneration) return@Runnable
+            if (!answered.compareAndSet(false, true)) return@Runnable
+            Log.w(TAG, "performApiLookupAndSpeak: 線上查詢逾時，改用本地標題解析播報。")
+            announceMetadata(title, extractMetadataFromLocalTitle(parseTitle(title)), controller)
+        }
+        mainHandler.postDelayed(timeoutTask, LOOKUP_TIMEOUT_MS)
+
         networkExecutor.execute {
             val metadata = try {
                 fetcher(title) ?: extractMetadataFromLocalTitle(parseTitle(title))
@@ -630,10 +969,14 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
             }
 
             mainHandler.post {
-                lastMetadata = metadata
-                val textToSpeak = generateSpeechText(metadata)
-                updateNotification("正在播報: $textToSpeak")
-                speakTitle(textToSpeak, controller)
+                mainHandler.removeCallbacks(timeoutTask)
+                // 查詢還在路上時使用者已經換到下一首歌，這筆結果直接丟棄，不然會播報上一首。
+                if (generation != lookupGeneration) {
+                    Log.w(TAG, "performApiLookupAndSpeak: 已換歌，丟棄過期的查詢結果。")
+                    return@post
+                }
+                if (!answered.compareAndSet(false, true)) return@post
+                announceMetadata(title, metadata, controller)
             }
         }
     }
@@ -747,7 +1090,7 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
         }
     }
 
-    private fun speakTitle(text: String, controller: MediaController) {
+    private fun speakTitle(text: String, controller: MediaController): Boolean {
         val audioDucking = sharedPrefs.getBoolean(MainActivity.KEY_AUDIO_DUCKING, true)
 
         if (audioDucking) {
@@ -773,9 +1116,14 @@ class MediaMonitorService : NotificationListenerService(), TextToSpeech.OnInitLi
         val result = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, utteranceId)
 
         if (result == TextToSpeech.ERROR) {
+            // 語音引擎被更新/重裝後會一直落到這裡，必須重建 TextToSpeech 才會恢復
             Log.e(TAG, "speakTitle: TTS 請求失敗 (Result code: ERROR)")
+            isTtsReady = false
             resumePlayback(utteranceId)
+            scheduleTtsRestart()
+            return false
         }
+        return true
     }
 
     private fun resumePlayback(utteranceId: String?) {

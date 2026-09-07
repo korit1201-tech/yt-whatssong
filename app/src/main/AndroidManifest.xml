@@ -26,6 +26,10 @@
         <package android:name="com.google.android.youtube" />
         <package android:name="com.google.android.apps.youtube.music" />
         <package android:name="app.revanced.android.youtube" />
+        <!-- ReVanced Extended (RVX) 用的是 app.rvx.* 命名，與官方 ReVanced 並存 -->
+        <package android:name="app.rvx.android.youtube" />
+        <package android:name="app.revanced.android.apps.youtube.music" />
+        <package android:name="app.rvx.android.apps.youtube.music" />
         <package android:name="com.spotify.music" />
     </queries>
     
